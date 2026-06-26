@@ -22,7 +22,7 @@ client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1"
 )
 
-MODEL_NAME = "llama-3.1-8b-instant"
+MODEL_NAME = "llama-3.3-70b-versatile"
 
 
 # ---------------------------
@@ -240,22 +240,14 @@ async def macro_agent(state: Dict[str, Any]) -> Dict[str, Any]:
 Sector: {profile.get('sector')}
 Industry: {profile.get('industry')}
 
-Return JSON with these exact field types:
-- rate_sensitivity: object with "factor" (string) and "impact" (string)
-- inflation_impact: object with "factor" (string) and "impact" (string)
-- sector_cycle_phase: object with "factor" (string) and "impact" (string)
-- fx_exposure: object with "factor" (string) and "impact" (string)
-- macro_tailwinds: array of objects, each with "factor" (string) and "impact" (string)
-- macro_headwinds: array of objects, each with "factor" (string) and "impact" (string)
-- overall_macro_score: number between 0 and 100
-
+Return JSON where ALL values must be plain strings or numbers (no nested objects):
 {{
-  "rate_sensitivity": {{"factor": "", "impact": ""}},
-  "inflation_impact": {{"factor": "", "impact": ""}},
-  "sector_cycle_phase": {{"factor": "", "impact": ""}},
-  "fx_exposure": {{"factor": "", "impact": ""}},
-  "macro_tailwinds": [{{"factor": "", "impact": ""}}],
-  "macro_headwinds": [{{"factor": "", "impact": ""}}],
+  "rate_sensitivity": "short plain text",
+  "inflation_impact": "short plain text",
+  "sector_cycle_phase": "short plain text",
+  "fx_exposure": "short plain text",
+  "macro_tailwinds": ["plain string 1", "plain string 2"],
+  "macro_headwinds": ["plain string 1", "plain string 2"],
   "overall_macro_score": 0
 }}
 """
@@ -263,24 +255,21 @@ Return JSON with these exact field types:
     raw = await _ask(system, user, f"macro-{state.get('ticker')}")
     result = _extract_json(raw)
 
-    # Normalize: if LLM returned plain strings instead of objects, convert them
+    # Normalize: if LLM returned objects instead of strings, extract a usable string
     for key in ["rate_sensitivity", "inflation_impact", "sector_cycle_phase", "fx_exposure"]:
         val = result.get(key)
-        if isinstance(val, str):
-            result[key] = {"factor": key.replace("_", " ").title(), "impact": val}
-        elif not isinstance(val, dict):
-            result[key] = {"factor": key.replace("_", " ").title(), "impact": "N/A"}
+        if isinstance(val, dict):
+            result[key] = val.get("impact") or val.get("factor") or str(val)
+        elif not isinstance(val, str):
+            result[key] = str(val) if val is not None else "—"
 
     for key in ["macro_tailwinds", "macro_headwinds"]:
         val = result.get(key)
         if isinstance(val, list):
-            normalized = []
-            for item in val:
-                if isinstance(item, str):
-                    normalized.append({"factor": item, "impact": "N/A"})
-                elif isinstance(item, dict):
-                    normalized.append(item)
-            result[key] = normalized
+            result[key] = [
+                (item.get("impact") or item.get("factor") or str(item)) if isinstance(item, dict) else str(item)
+                for item in val
+            ]
         else:
             result[key] = []
 
