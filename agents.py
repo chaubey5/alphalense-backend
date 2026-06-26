@@ -240,20 +240,51 @@ async def macro_agent(state: Dict[str, Any]) -> Dict[str, Any]:
 Sector: {profile.get('sector')}
 Industry: {profile.get('industry')}
 
-Return JSON:
+Return JSON with these exact field types:
+- rate_sensitivity: object with "factor" (string) and "impact" (string)
+- inflation_impact: object with "factor" (string) and "impact" (string)
+- sector_cycle_phase: object with "factor" (string) and "impact" (string)
+- fx_exposure: object with "factor" (string) and "impact" (string)
+- macro_tailwinds: array of objects, each with "factor" (string) and "impact" (string)
+- macro_headwinds: array of objects, each with "factor" (string) and "impact" (string)
+- overall_macro_score: number between 0 and 100
+
 {{
-  "rate_sensitivity": "",
-  "inflation_impact": "",
-  "sector_cycle_phase": "",
-  "fx_exposure": "",
-  "macro_tailwinds": [],
-  "macro_headwinds": [],
+  "rate_sensitivity": {{"factor": "", "impact": ""}},
+  "inflation_impact": {{"factor": "", "impact": ""}},
+  "sector_cycle_phase": {{"factor": "", "impact": ""}},
+  "fx_exposure": {{"factor": "", "impact": ""}},
+  "macro_tailwinds": [{{"factor": "", "impact": ""}}],
+  "macro_headwinds": [{{"factor": "", "impact": ""}}],
   "overall_macro_score": 0
 }}
 """
 
     raw = await _ask(system, user, f"macro-{state.get('ticker')}")
-    return _extract_json(raw)
+    result = _extract_json(raw)
+
+    # Normalize: if LLM returned plain strings instead of objects, convert them
+    for key in ["rate_sensitivity", "inflation_impact", "sector_cycle_phase", "fx_exposure"]:
+        val = result.get(key)
+        if isinstance(val, str):
+            result[key] = {"factor": key.replace("_", " ").title(), "impact": val}
+        elif not isinstance(val, dict):
+            result[key] = {"factor": key.replace("_", " ").title(), "impact": "N/A"}
+
+    for key in ["macro_tailwinds", "macro_headwinds"]:
+        val = result.get(key)
+        if isinstance(val, list):
+            normalized = []
+            for item in val:
+                if isinstance(item, str):
+                    normalized.append({"factor": item, "impact": "N/A"})
+                elif isinstance(item, dict):
+                    normalized.append(item)
+            result[key] = normalized
+        else:
+            result[key] = []
+
+    return result
 
 
 async def moderator_agent(state: Dict[str, Any]) -> Dict[str, Any]:
