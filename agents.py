@@ -1,14 +1,22 @@
 """
-Multi-agent AI orchestration for AlphaLens.
-Converted to Groq (OpenAI-compatible API).
+AlphaLens Multi-Agent Orchestration — LangGraph Edition
+Supervisor-Worker pattern:
+  Phase 1 (parallel): research, financial, valuation, macro
+  Phase 2 (parallel): bull, bear
+  Phase 3 (sequential): moderator (supervisor)
+
+server.py calls run_pipeline_streaming(state, emit) — interface unchanged.
 """
 import os
 import json
 import logging
 import asyncio
 import re
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, TypedDict, Annotated
+import operator
+
 from openai import AsyncOpenAI
+from langgraph.graph import StateGraph, END
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +34,34 @@ MODEL_NAME = "llama-3.3-70b-versatile"
 
 
 # ---------------------------
-# JSON EXTRACTION
+# LANGGRAPH STATE SCHEMA
+# ---------------------------
+class AlphaLensState(TypedDict):
+    # --- Input market data (set before graph starts) ---
+    ticker: str
+    profile: Dict[str, Any]
+    quote: Dict[str, Any]
+    financials: Dict[str, Any]
+    ratios: Dict[str, Any]
+    peers: List[Any]
+    analyst: Dict[str, Any]
+    news: List[Any]
+
+    # --- Agent outputs (filled by nodes) ---
+    research: Dict[str, Any]
+    financial: Dict[str, Any]
+    valuation: Dict[str, Any]
+    macro: Dict[str, Any]
+    bull: Dict[str, Any]
+    bear: Dict[str, Any]
+    moderator: Dict[str, Any]
+
+    # --- SSE emitter (callable, passed through state) ---
+    emit: Any  # Callable — not serializable but stays in memory
+
+
+# ---------------------------
+# JSON EXTRACTION UTILITY
 # ---------------------------
 def _extract_json(text: str) -> Dict[str, Any]:
     if not text:
@@ -44,7 +79,6 @@ def _extract_json(text: str) -> Dict[str, Any]:
 
     depth = 0
     end = -1
-
     for i in range(start, len(text)):
         if text[i] == "{":
             depth += 1
@@ -73,41 +107,43 @@ async def _ask(system: str, user: str, session_id: str) -> str:
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": user}
+                {"role": "user", "content": user},
             ],
             temperature=0.7,
-            max_tokens=4000
+            max_tokens=4000,
         )
-
-        print("\n=== GROQ RESPONSE ===")
-        print(response.choices[0].message.content)
-
-        return response.choices[0].message.content
-
+        content = response.choices[0].message.content
+        print(f"\n=== GROQ RESPONSE [{session_id}] ===\n{content}")
+        return content
     except Exception as e:
-        print(f"\n=== GROQ ERROR === {e}")
+        print(f"\n=== GROQ ERROR [{session_id}] === {e}")
         logger.error(f"Groq LLM error ({session_id}): {e}")
         return ""
 
 
-# ---------------------------
-# AGENTS
-# ---------------------------
+# ============================================================
+# LANGGRAPH NODES
+# Each node receives the full state dict and returns a partial
+# update dict — LangGraph merges it back into state.
+# ============================================================
 
-async def research_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+async def node_research(state: AlphaLensState) -> Dict[str, Any]:
+    """Research agent node — business overview, moat, risks."""
+    emit = state.get("emit")
+    if emit:
+        await emit("agent_start", {"agent": "research"})
+
     profile = state.get("profile") or {}
     peers = state.get("peers") or []
-
     peer_str = ", ".join(
         [p.get("ticker", "") if isinstance(p, dict) else str(p) for p in peers]
     ) or "n/a"
 
     system = "You are a senior equity research analyst. Respond ONLY with valid JSON."
-
     user = f"""
 Company: {profile.get('name')} ({state.get('ticker')})
 Sector: {profile.get('sector')} | Industry: {profile.get('industry')}
-Description: {profile.get('description','')[:1500]}
+Description: {profile.get('description', '')[:1500]}
 Peers: {peer_str}
 
 Return JSON:
@@ -121,17 +157,25 @@ Return JSON:
   "key_risks": []
 }}
 """
-
     raw = await _ask(system, user, f"research-{state.get('ticker')}")
-    return _extract_json(raw)
+    result = _extract_json(raw)
+
+    if emit:
+        await emit("agent_done", {"agent": "research", "data": result})
+
+    return {"research": result}
 
 
-async def financial_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+async def node_financial(state: AlphaLensState) -> Dict[str, Any]:
+    """Financial agent node — margins, growth, health."""
+    emit = state.get("emit")
+    if emit:
+        await emit("agent_start", {"agent": "financial"})
+
     fin = state.get("financials") or {}
     ratios = state.get("ratios") or {}
 
     system = "You are a CFA-level financial analyst. Respond ONLY with valid JSON."
-
     user = f"""
 Ticker: {state.get('ticker')}
 Income: {json.dumps(fin.get('income', []))[:2000]}
@@ -154,17 +198,25 @@ Return JSON:
   "key_observations": []
 }}
 """
-
     raw = await _ask(system, user, f"fin-{state.get('ticker')}")
-    return _extract_json(raw)
+    result = _extract_json(raw)
+
+    if emit:
+        await emit("agent_done", {"agent": "financial", "data": result})
+
+    return {"financial": result}
 
 
-async def valuation_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+async def node_valuation(state: AlphaLensState) -> Dict[str, Any]:
+    """Valuation agent node — DCF, PE, EV/EBITDA fair values."""
+    emit = state.get("emit")
+    if emit:
+        await emit("agent_start", {"agent": "valuation"})
+
     ratios = state.get("ratios") or {}
     quote = state.get("quote") or {}
 
     system = "You are a valuation expert. Respond ONLY with valid JSON."
-
     user = f"""
 Ticker: {state.get('ticker')}
 Price: {quote.get('price')}
@@ -186,14 +238,55 @@ Return JSON:
   "reasoning": ""
 }}
 """
-
     raw = await _ask(system, user, f"val-{state.get('ticker')}")
-    return _extract_json(raw)
+    result = _extract_json(raw)
+
+    if emit:
+        await emit("agent_done", {"agent": "valuation", "data": result})
+
+    return {"valuation": result}
 
 
-async def bull_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+async def node_macro(state: AlphaLensState) -> Dict[str, Any]:
+    """Macro agent node — rate sensitivity, sector cycle, FX."""
+    emit = state.get("emit")
+    if emit:
+        await emit("agent_start", {"agent": "macro"})
+
+    profile = state.get("profile") or {}
+
+    system = "You are a macroeconomic analyst. Respond ONLY with valid JSON."
+    user = f"""
+Sector: {profile.get('sector')}
+Industry: {profile.get('industry')}
+
+Return JSON:
+{{
+  "rate_sensitivity": "",
+  "inflation_impact": "",
+  "sector_cycle_phase": "",
+  "fx_exposure": "",
+  "macro_tailwinds": [],
+  "macro_headwinds": [],
+  "overall_macro_score": 0
+}}
+"""
+    raw = await _ask(system, user, f"macro-{state.get('ticker')}")
+    result = _extract_json(raw)
+
+    if emit:
+        await emit("agent_done", {"agent": "macro", "data": result})
+
+    return {"macro": result}
+
+
+async def node_bull(state: AlphaLensState) -> Dict[str, Any]:
+    """Bull agent node — investment thesis and catalysts."""
+    emit = state.get("emit")
+    if emit:
+        await emit("agent_start", {"agent": "bull"})
+
     system = "You are a bullish investor. Respond ONLY with valid JSON."
-
     user = f"""
 Research: {json.dumps(state.get('research', {}))[:1200]}
 Financial: {json.dumps(state.get('financial', {}))[:1200]}
@@ -206,14 +299,22 @@ Return JSON:
   "target_upside_pct": 0
 }}
 """
-
     raw = await _ask(system, user, f"bull-{state.get('ticker')}")
-    return _extract_json(raw)
+    result = _extract_json(raw)
+
+    if emit:
+        await emit("agent_done", {"agent": "bull", "data": result})
+
+    return {"bull": result}
 
 
-async def bear_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+async def node_bear(state: AlphaLensState) -> Dict[str, Any]:
+    """Bear agent node — risks and downside thesis."""
+    emit = state.get("emit")
+    if emit:
+        await emit("agent_start", {"agent": "bear"})
+
     system = "You are a bearish investor. Respond ONLY with valid JSON."
-
     user = f"""
 Research: {json.dumps(state.get('research', {}))[:1200]}
 Financial: {json.dumps(state.get('financial', {}))[:1200]}
@@ -226,59 +327,22 @@ Return JSON:
   "target_downside_pct": 0
 }}
 """
-
     raw = await _ask(system, user, f"bear-{state.get('ticker')}")
-    return _extract_json(raw)
-
-
-async def macro_agent(state: Dict[str, Any]) -> Dict[str, Any]:
-    profile = state.get("profile") or {}
-
-    system = "You are a macroeconomic analyst. Respond ONLY with valid JSON."
-
-    user = f"""
-Sector: {profile.get('sector')}
-Industry: {profile.get('industry')}
-
-Return JSON where ALL values must be plain strings or numbers (no nested objects):
-{{
-  "rate_sensitivity": "short plain text",
-  "inflation_impact": "short plain text",
-  "sector_cycle_phase": "short plain text",
-  "fx_exposure": "short plain text",
-  "macro_tailwinds": ["plain string 1", "plain string 2"],
-  "macro_headwinds": ["plain string 1", "plain string 2"],
-  "overall_macro_score": 0
-}}
-"""
-
-    raw = await _ask(system, user, f"macro-{state.get('ticker')}")
     result = _extract_json(raw)
 
-    # Normalize: if LLM returned objects instead of strings, extract a usable string
-    for key in ["rate_sensitivity", "inflation_impact", "sector_cycle_phase", "fx_exposure"]:
-        val = result.get(key)
-        if isinstance(val, dict):
-            result[key] = val.get("impact") or val.get("factor") or str(val)
-        elif not isinstance(val, str):
-            result[key] = str(val) if val is not None else "—"
+    if emit:
+        await emit("agent_done", {"agent": "bear", "data": result})
 
-    for key in ["macro_tailwinds", "macro_headwinds"]:
-        val = result.get(key)
-        if isinstance(val, list):
-            result[key] = [
-                (item.get("impact") or item.get("factor") or str(item)) if isinstance(item, dict) else str(item)
-                for item in val
-            ]
-        else:
-            result[key] = []
-
-    return result
+    return {"bear": result}
 
 
-async def moderator_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+async def node_moderator(state: AlphaLensState) -> Dict[str, Any]:
+    """Moderator / Supervisor node — final INVEST/HOLD/PASS verdict."""
+    emit = state.get("emit")
+    if emit:
+        await emit("agent_start", {"agent": "moderator"})
+
     system = "You are a CIO. Return final INVEST/HOLD/PASS decision in JSON only."
-
     user = f"""
 Ticker: {state.get('ticker')}
 Price: {state.get('quote', {}).get('price')}
@@ -302,56 +366,120 @@ Return JSON:
   "what_would_change_view": []
 }}
 """
-
     raw = await _ask(system, user, f"mod-{state.get('ticker')}")
-    return _extract_json(raw)
+    result = _extract_json(raw)
+
+    if emit:
+        await emit("agent_done", {"agent": "moderator", "data": result})
+
+    return {"moderator": result}
 
 
-# ---------------------------
-# PIPELINE
-# ---------------------------
-async def run_pipeline_streaming(state: Dict[str, Any], emit):
-    await emit("agent_start", {"agent": "research"})
-    await emit("agent_start", {"agent": "financial"})
-    await emit("agent_start", {"agent": "valuation"})
-    await emit("agent_start", {"agent": "macro"})
+# ============================================================
+# PHASE WRAPPER NODES
+# LangGraph doesn't natively run nodes in parallel within one
+# graph step, so we create "phase" wrapper nodes that run the
+# worker agents concurrently via asyncio.gather — giving us
+# true parallelism inside the graph.
+# ============================================================
 
-    r, f, v, m = await asyncio.gather(
-        research_agent(state),
-        financial_agent(state),
-        valuation_agent(state),
-        macro_agent(state),
+async def node_phase1(state: AlphaLensState) -> Dict[str, Any]:
+    """
+    Phase 1 supervisor node — runs Research, Financial, Valuation,
+    Macro agents in parallel using asyncio.gather.
+    """
+    results = await asyncio.gather(
+        node_research(state),
+        node_financial(state),
+        node_valuation(state),
+        node_macro(state),
     )
+    # Merge all partial dicts into one update
+    merged = {}
+    for r in results:
+        merged.update(r)
+    return merged
 
-    state["research"] = r
-    state["financial"] = f
-    state["valuation"] = v
-    state["macro"] = m
 
-    await emit("agent_done", {"agent": "research", "data": r})
-    await emit("agent_done", {"agent": "financial", "data": f})
-    await emit("agent_done", {"agent": "valuation", "data": v})
-    await emit("agent_done", {"agent": "macro", "data": m})
-
-    await emit("agent_start", {"agent": "bull"})
-    await emit("agent_start", {"agent": "bear"})
-
-    bull, bear = await asyncio.gather(
-        bull_agent(state),
-        bear_agent(state),
+async def node_phase2(state: AlphaLensState) -> Dict[str, Any]:
+    """
+    Phase 2 supervisor node — runs Bull and Bear agents in parallel.
+    Phase 1 outputs (research/financial/valuation) are now in state.
+    """
+    results = await asyncio.gather(
+        node_bull(state),
+        node_bear(state),
     )
+    merged = {}
+    for r in results:
+        merged.update(r)
+    return merged
 
-    state["bull"] = bull
-    state["bear"] = bear
 
-    await emit("agent_done", {"agent": "bull", "data": bull})
-    await emit("agent_done", {"agent": "bear", "data": bear})
+# ============================================================
+# BUILD THE LANGGRAPH GRAPH
+# ============================================================
 
-    await emit("agent_start", {"agent": "moderator"})
+def _build_graph() -> Any:
+    """
+    Compile the AlphaLens supervisor-worker graph.
 
-    mod = await moderator_agent(state)
-    state["moderator"] = mod
+    Graph topology:
+        START → phase1 → phase2 → moderator → END
 
-    await emit("agent_done", {"agent": "moderator", "data": mod})
+    phase1 and phase2 are "super-nodes" that internally run
+    worker agents in parallel via asyncio.gather, mimicking
+    LangGraph's Send() parallel dispatch pattern in a way that
+    is fully compatible with FastAPI's asyncio event loop.
+    """
+    graph = StateGraph(AlphaLensState)
+
+    # Register nodes
+    graph.add_node("phase1", node_phase1)       # Research + Financial + Valuation + Macro
+    graph.add_node("phase2", node_phase2)       # Bull + Bear
+    graph.add_node("moderator", node_moderator) # Supervisor / CIO
+
+    # Wire the edges
+    graph.set_entry_point("phase1")
+    graph.add_edge("phase1", "phase2")
+    graph.add_edge("phase2", "moderator")
+    graph.add_edge("moderator", END)
+
+    return graph.compile()
+
+
+# Compile once at import time — reused for every request
+_GRAPH = _build_graph()
+
+
+# ============================================================
+# PUBLIC API — called by server.py (interface unchanged)
+# ============================================================
+
+async def run_pipeline_streaming(state: Dict[str, Any], emit) -> Dict[str, Any]:
+    """
+    Run the LangGraph supervisor-worker pipeline.
+
+    Injects the SSE emit callable into state so every node can
+    fire agent_start / agent_done events as it runs — server.py
+    sees the same SSE event stream as before.
+
+    Returns the final state dict (server.py reads state["moderator"] etc.)
+    """
+    # Inject emitter so nodes can fire SSE events
+    state["emit"] = emit
+
+    # Provide default empty dicts for agent output keys
+    # (LangGraph requires all TypedDict keys to exist in initial state)
+    for key in ("research", "financial", "valuation", "macro", "bull", "bear", "moderator"):
+        state.setdefault(key, {})
+
+    # ainvoke runs the compiled graph asynchronously
+    final_state = await _GRAPH.ainvoke(state)
+
+    # Copy results back into the original state dict
+    # (server.py reads from the same dict reference it passed in)
+    for key in ("research", "financial", "valuation", "macro", "bull", "bear", "moderator"):
+        state[key] = final_state.get(key, {})
 
     return state
